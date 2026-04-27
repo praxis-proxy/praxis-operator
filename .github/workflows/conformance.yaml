@@ -1,0 +1,140 @@
+name: Conformance
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  KIND_CLUSTER_NAME: praxis-conformance
+  PRAXIS_IMAGE: ghcr.io/praxis-proxy/praxis:0.3.0
+  OPERATOR_IMAGE: praxis-operator:dev
+  GWAPI_VERSION: v1.5.1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gateway API conformance suite
+  # ---------------------------------------------------------------------------
+
+  gateway-api:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Login to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build operator image
+        run: docker build -t praxis-operator:dev -f Containerfile .
+
+      - name: Pull praxis image
+        run: docker pull ghcr.io/praxis-proxy/praxis:0.3.0
+
+      - name: Install KIND
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create KIND cluster
+        run: kind create cluster --name praxis-conformance --config hack/kind-config.yaml --wait 60s
+
+      - name: Install Gateway API CRDs
+        run: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+
+      - name: Install MetalLB
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          kubectl wait --namespace metallb-system \
+              --for=condition=ready pod \
+              --selector=app=metallb \
+              --timeout=300s
+
+      - name: Configure MetalLB IP pool
+        run: |
+          SUBNET=$(docker network inspect kind \
+              -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' \
+              | tr ' ' '\n' | grep '\.' | head -1)
+          IFS='.' read -r a b c d <<< "${SUBNET%%/*}"
+          cat <<EOF | kubectl apply -f -
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: kind-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+              - ${a}.${b}.255.200-${a}.${b}.255.210
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: l2
+            namespace: metallb-system
+          EOF
+
+      - name: Load container images
+        run: |
+          kind load docker-image praxis-operator:dev          --name praxis-conformance
+          kind load docker-image ghcr.io/praxis-proxy/praxis:0.3.0 --name praxis-conformance
+
+      - name: Deploy operator
+        run: |
+          kubectl apply -f deploy/rbac.yaml
+          kubectl apply -f deploy/deployment.yaml
+          kubectl apply -f deploy/gatewayclass.yaml
+          kubectl -n praxis-system rollout status deployment/praxis-operator --timeout=120s
+
+      - name: Install Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: "1.24"
+          cache: false
+
+      - name: Conformance tests
+        run: |
+          git clone --depth 1 --branch monthly-2026.05 \
+              https://github.com/kubernetes-sigs/gateway-api.git /tmp/gateway-api
+          cd /tmp/gateway-api
+          go test ./conformance -run TestConformance \
+              -timeout 30m -v \
+              -args \
+              --gateway-class=praxis \
+              --conformance-profiles=GATEWAY-HTTP \
+              --timeout-config-overrides="MaxTimeToConsistency:120;NamespacesMustBeReady:600" \
+              --allow-crds-mismatch \
+              --debug \
+              --report-output=/tmp/conformance-report.yaml \
+              --organization=praxis-proxy \
+              --project=praxis-operator \
+              --version=v0.1.0 \
+              --url=https://github.com/praxis-proxy/praxis-operator \
+              --contact=@shaneutt
+
+      - name: Upload conformance report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-report
+          path: /tmp/conformance-report.yaml
+          if-no-files-found: ignore

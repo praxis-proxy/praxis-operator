@@ -1,0 +1,115 @@
+name: Tests (Integration)
+
+# ------------------------------------------------------------------------------
+# Workflow Settings
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Enable verbose test output (V=1)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  V: ${{ inputs.debug && '1' || '' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Integration tests (KIND + operator)
+  # ---------------------------------------------------------------------------
+
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@10c3493d811a9096cee4fdf287e41e852f6a51ba # 1.94.0
+
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-rust-1.94.0-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.94.0-cargo-
+          save-always: true
+
+      - name: Build operator image
+        run: docker build -t praxis-operator:dev -f Containerfile .
+
+      - name: Install KIND
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create KIND cluster
+        run: kind create cluster --name ci --config hack/kind-config.yaml --wait 60s
+
+      - name: Install Gateway API CRDs
+        run: kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+
+      - name: Install MetalLB
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.9/config/manifests/metallb-native.yaml
+          kubectl wait --namespace metallb-system \
+              --for=condition=ready pod \
+              --selector=app=metallb \
+              --timeout=300s
+
+      - name: Configure MetalLB IP pool
+        run: |
+          SUBNET=$(docker network inspect kind \
+              -f '{{range .IPAM.Config}}{{.Subnet}} {{end}}' \
+              | tr ' ' '\n' | grep '\.' | head -1)
+          IFS='.' read -r a b c d <<< "${SUBNET%%/*}"
+          cat <<EOF | kubectl apply -f -
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: kind-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+              - ${a}.${b}.255.200-${a}.${b}.255.210
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: l2
+            namespace: metallb-system
+          EOF
+
+      - name: Load operator image
+        run: kind load docker-image praxis-operator:dev --name ci
+
+      - name: Deploy operator
+        run: |
+          kubectl apply -f deploy/rbac.yaml
+          kubectl apply -f deploy/deployment.yaml
+          kubectl apply -f deploy/gatewayclass.yaml
+          kubectl -n praxis-system rollout status deployment/praxis-operator --timeout=120s
+
+      - name: Integration tests
+        run: make test-integration
